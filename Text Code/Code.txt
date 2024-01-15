@@ -1,0 +1,341 @@
+import cv2
+import face_recognition
+import os
+import postgresql
+
+directory = os.path.dirname(__file__)
+
+db = postgresql.connect(dbname='DB-Face', user='postgres', password='Beam12345', host='127.0.0.1', port=5432)
+
+
+def open_webcam():
+    return cv2.VideoCapture(0)
+
+capture = open_webcam()
+
+if not capture.isOpened():
+    print("ไม่สามารถเปิดกล้องได้")
+    exit()
+
+while True:
+    result, frame = capture.read()
+
+    if not result:
+        print("ไม่สามารถอ่านภาพจากกล้องได้")
+        break
+
+    cv2.imshow("Webcam", frame)
+
+    key = cv2.waitKey(10)
+    if key == ord('q'):
+        break
+
+capture.release()
+cv2.destroyAllWindows()
+
+---------------------------------------- เชื่อมฐานข้อมูลและตรวจจับใบหน้า ส่งแจ้งเตือนไปยังไลน์ตอนเจอใบหน้าใหม่พร้อมกับรูป ----------------------------------------
+
+import cv2
+import face_recognition
+import os
+import psycopg2
+import requests
+import json
+
+LINE_NOTIFY_TOKEN = '6n6NUX9mdUjHysH3IqGEdyuN5Wmh6BPZwaZNlzuJr44'
+
+directory = os.path.dirname(__file__)
+
+db = psycopg2.connect('dbname=DB-Face user=postgres password=Beam12345 host=127.0.0.1 port=5432')
+
+def open_cam_rtsp(uri, width, height, latency):
+    gst_str = ("rtspsrc location={} latency={} ! application/x-rtp,media=video ! rtph264depay ! h264parse ! nvv4l2decoder ! "
+               "nvvidconv ! video/x-raw,width=(int){},height=(int){}, format=(string)BGRx ! videorate ! video/x-raw,framerate=2/1 ! "
+               "appsink sync=false").format(uri, latency, width, height)
+   
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
+capture = cv2.VideoCapture(0)
+
+if not capture.isOpened():
+    exit()
+
+detected_faces = set()
+
+def send_line_notify(message, image_path=None):
+    url = 'https://notify-api.line.me/api/notify'
+    headers = {'Authorization': 'Bearer ' + LINE_NOTIFY_TOKEN}
+    
+    payload = {'message': message}
+
+    if image_path:
+        files = {'imageFile': open(image_path, 'rb')}
+        response = requests.post(url, headers=headers, data=payload, files=files, verify=r"C:\Program Files\PostgreSQL\16\ssl\certs\cacert-2023-12-12.pem")
+    else:
+        response = requests.post(url, headers=headers, data=payload)
+
+    return response.status_code
+
+def save_face_to_database(encodings):
+    # เชื่อมต่อกับฐานข้อมูล
+    db = psycopg2.connect('dbname=DB-Face user=postgres password=Beam12345 host=127.0.0.1 port=5432')
+
+    # บันทึกข้อมูลใบหน้าใหม่ลงในฐานข้อมูล
+    query = "INSERT INTO vectors (vec_low, vec_high) VALUES (CUBE(array[{}]), CUBE(array[{}]))".format(
+        ','.join(str(s) for s in encodings[0][0:64]),
+        ','.join(str(s) for s in encodings[0][64:128])
+    )
+    cursor = db.cursor()
+    cursor.execute(query)
+    db.commit()
+    cursor.close()
+    db.close()
+
+boxes = ""
+weights = os.path.join(directory, r"C:\Users\HP\Desktop\Detect-SQL\Model\face_detection_yunet_2023mar.onnx")
+face_detector = cv2.FaceDetectorYN_create(weights, "", (0, 0), 0.8, 0.3, 5000, 5, 6)
+currentname = "unknown"
+
+while True:
+    result, frame = capture.read()
+    if result is False:
+        cv2.waitKey(0)
+        break
+
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    height, width, _ = frame.shape
+    face_detector.setInputSize((width, height))
+
+    _, faces = face_detector.detect(frame)
+    faces = faces if faces is not None else []
+    print("===============================================")
+
+for face in faces:
+    name = "Unknown"
+    box = list(map(int, face[:4]))
+    x = box[0]
+    y = box[1]
+    w = box[2]
+    h = box[3]
+    confidence = face[14]
+
+    boxes = [(y, x + w, y + h, x)]
+
+    encodings = face_recognition.face_encodings(frame, boxes)
+
+    threshold = 0.5
+    if len(encodings) > 0 and confidence > 0.6:
+        # Ensure that encodings[0] is not empty before accessing its elements
+        if len(encodings[0]) >= 128:
+            query = "SELECT id, file, image_id FROM vectors WHERE sqrt(power(CUBE(array[{}]) <-> vec_low, 2) + power(CUBE(array[{}]) <-> vec_high, 2)) <= {} ".format(
+                ','.join(str(s) for s in encodings[0][0:64]),
+                ','.join(str(s) for s in encodings[0][64:128]),
+                threshold,
+            ) + \
+                "ORDER BY sqrt(power(CUBE(array[{}]) <-> vec_low, 2) + power(CUBE(array[{}]) <-> vec_high, 2)) ASC".format(
+                    ','.join(str(s) for s in encodings[0][0:64]),
+                    ','.join(str(s) for s in encodings[0][64:128])
+                )
+            cursor = db.cursor()
+            cursor.execute(query)
+            face_record = cursor.fetchall()
+            cursor.close()
+
+            if len(face_record) > 0:
+                print(face_record)
+                print(len(face_record))
+                i = face_record[0]
+                name = str(i[3])
+                cv2.putText(frame, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
+                name = "Unknown"
+            else:
+                # ตรวจสอบว่าใบหน้านี้ได้ถูกตรวจจับและแจ้งเตือนไปยัง Line แล้วหรือไม่
+                if name not in detected_faces:
+                    # แจ้งเตือนผ่าน Line Notify
+                    message = f"พบใบหน้าใหม่: {name}"
+                    image_path = 'new_face.jpg'
+                    cv2.imwrite(image_path, frame)
+                    send_line_notify(message, image_path)
+                    
+                    # บันทึกใบหน้าใหม่ลงในฐานข้อมูล
+                    save_face_to_database(encodings[0])
+
+                    # เพิ่มชื่อใบหน้าในเซ็ตเพื่อไม่ต้องแจ้งเตือนซ้ำ
+                    detected_faces.add(name)
+
+                # แสดงผลลัพธ์บนภาพ
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(frame, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
+    print("===============================================")
+
+    cv2.imshow("face detection", frame)
+    key = cv2.waitKey(10)
+    if key == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+
+---------------------------------------- เชื่อมฐานข้อมูล,เปิดกล้องเว็บแคม,ตรวจจับใบหน้าและจดจำ  ----------------------------------------
+
+import cv2
+import face_recognition
+import os
+import psycopg2
+
+# กำหนดตำแหน่งไดเรกทอรีของไฟล์ที่ทำงาน
+directory = os.path.dirname(__file__)
+
+# เชื่อมต่อกับฐานข้อมูล PostgreSQL
+db = psycopg2.connect('dbname=DB-Face user=postgres password=Beam12345 host=127.0.0.1 port=5432')
+
+# ฟังก์ชันสำหรับบันทึกใบหน้าลงในฐานข้อมูล
+def save_face_to_database(encoding):
+    # สร้างคำสั่ง SQL สำหรับการเพิ่มข้อมูลใบหน้าลงในฐานข้อมูล
+    insert_query = "INSERT INTO vectors (vec_low, vec_high) VALUES (CUBE(array[{}]), CUBE(array[{}]))".format(
+        ','.join(str(s) for s in encoding[0:64]),
+        ','.join(str(s) for s in encoding[64:128])
+    )
+
+    # เริ่มการเพิ่มข้อมูลในฐานข้อมูล
+    with db.cursor() as cursor:
+        cursor.execute(insert_query)
+    db.commit()
+
+# ฟังก์ชันสำหรับเปิดกล้อง RTSP
+def open_cam_rtsp(uri, width, height, latency):
+    gst_str = ("rtspsrc location={} latency={} ! application/x-rtp,media=video ! rtph264depay ! h264parse ! nvv4l2decoder ! "
+               "nvvidconv ! video/x-raw,width=(int){},height=(int){}, format=(string)BGRx ! videorate ! video/x-raw,framerate=2/1 ! "
+               "appsink sync=false").format(uri, latency, width, height)
+   
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
+# เปิดกล้อง VideoCapture ด้วย URL ของกล้อง RTSP
+capture = cv2.VideoCapture(0)
+
+# ตรวจสอบว่ากล้องถูกเปิดหรือไม่
+if not capture.isOpened():
+    exit()
+
+# กำหนดตัวแปรสำหรับใช้ในการตรวจจับใบหน้า
+boxes = ""
+weights = os.path.join(directory, r"C:\Users\HP\Desktop\Detect-SQL\Model\face_detection_yunet_2023mar.onnx")
+face_detector = cv2.FaceDetectorYN_create(weights, "", (0, 0), 0.8, 0.3, 5000, 5, 6)
+currentname = "unknown"
+
+# เซ็ตตัวแปร detected_faces เพื่อเก็บชื่อใบหน้าที่ตรวจจับแล้ว
+detected_faces = set()
+
+# กำหนดตัวแปร name เป็น "unknown"
+name = "unknown"
+
+while True:
+    # อ่านภาพจากกล้อง
+    result, frame = capture.read()
+    if result is False:
+        cv2.waitKey(0)
+        break
+
+    # แปลงรูปภาพเป็น RGB
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # ดึงขนาดของภาพ
+    height, width, _ = frame.shape
+    face_detector.setInputSize((width, height))
+
+    # ตรวจจับใบหน้าในภาพ
+    _, faces = face_detector.detect(frame)
+    faces = faces if faces is not None else []
+    print("===============================================")
+
+    # Loop สำหรับการประมวลผลทุกใบหน้า
+    for face in faces:
+        # ดึงข้อมูลของใบหน้า
+        box = list(map(int, face[:4]))
+        x, y, w, h = box
+        confidence = face[14]
+
+        # สร้างตัวแปร boxes สำหรับ face_recognition
+        boxes = [(y, x + w, y + h, x)]
+
+        # ดึงลักษณะของใบหน้า (face encoding)
+        encodings = face_recognition.face_encodings(frame, boxes)
+
+        # กำหนด threshold สำหรับการตรวจสอบใบหน้าในฐานข้อมูล
+        threshold = 0.5
+        if len(encodings) > 0 and confidence > 0.6:
+            # สร้าง query สำหรับค้นหาใบหน้าในฐานข้อมูล
+            query = "SELECT id, file, image_id FROM vectors WHERE sqrt(power(CUBE(array[{}]) <-> vec_low, 2) + power(CUBE(array[{}]) <-> vec_high, 2)) <= {} ".format(
+                ','.join(str(s) for s in encodings[0][0:64]),
+                ','.join(str(s) for s in encodings[0][64:128]),
+                threshold,
+            ) + \
+                "ORDER BY sqrt(power(CUBE(array[{}]) <-> vec_low, 2) + power(CUBE(array[{}]) <-> vec_high, 2)) ASC".format(
+                    ','.join(str(s) for s in encodings[0][0:64]),
+                    ','.join(str(s) for s in encodings[0][64:128])
+                )
+
+            # เริ่มการค้นหาในฐานข้อมูล
+            with db.cursor() as cursor:
+                cursor.execute(query)
+                face_record = cursor.fetchall()
+
+            # สร้าง query สำหรับดึงข้อมูลที่เพิ่งถูกบันทึก
+            select_query = "SELECT id, file, image_id FROM vectors ORDER BY id DESC LIMIT 1"
+
+            # ทำการค้นหาข้อมูลในฐานข้อมูล
+            with db.cursor() as cursor:
+                cursor.execute(select_query)
+                latest_face_record = cursor.fetchone()
+
+            # ตรวจสอบว่ามีข้อมูลหรือไม่
+            if latest_face_record:
+                print("ข้อมูลใบหน้าล่าสุด:")
+                print("ID:", latest_face_record[0])
+                print("File:", latest_face_record[1])
+                print("Image ID:", latest_face_record[2])
+            else:
+                print("ไม่พบข้อมูลใบหน้าในฐานข้อมูล")
+
+            # ตรวจสอบว่าใบหน้านี้มีข้อมูลในฐานข้อมูลหรือไม่
+            if len(face_record) > 0:
+                print(face_record)
+                print(len(face_record))
+                i = face_record[0]
+                # ตรวจสอบว่ามี index ที่ 3 หรือไม่
+                if len(i) > 3:
+                    name = str(i[3])
+                    cv2.putText(frame, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
+                else:
+                    print("ข้อมูลใบหน้าไม่ถูกต้อง")
+                name = "Unknown"
+            else:
+                # ตรวจสอบว่าใบหน้านี้ได้ถูกตรวจจับและบันทึกลงในฐานข้อมูลแล้วหรือไม่
+                if name not in detected_faces:
+                    # บันทึกใบหน้าใหม่ลงในฐานข้อมูล
+                    save_face_to_database(encodings[0])
+
+                    # เพิ่มชื่อใบหน้าในเซ็ตเพื่อไม่ต้องแจ้งเตือนซ้ำ
+                    detected_faces.add(name)
+
+                # แสดงผลลัพธ์บนภาพ
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(frame, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
+
+                print("===============================================")
+
+                # แสดงภาพที่ได้หลังจากประมวลผล
+                cv2.imshow("face detection", frame)
+
+    # ตรวจสอบการกดปุ่ม 'q' เพื่อออก
+    key = cv2.waitKey(10)
+    if key == ord('q'):
+        break
+
+# ปิดหน้าต่างทุกอย่างเมื่อทำการตรวจจับใบหน้าเสร็จสิ้น
+cv2.destroyAllWindows()
+
+# ปิดการเชื่อมต่อฐานข้อมูล
+db.close()
